@@ -23,32 +23,27 @@
         input:focus { border-color: var(--accent); }
 
         .btn-print { background: #34c759; color: #fff; display: none; width: 100%; padding: 18px; border-radius: 14px; border: none; font-weight: 800; font-size: 16px; text-transform: uppercase; cursor: pointer; margin-top: 10px; }
+        .print-hint { display: none; text-align: center; font-size: 12px; color: var(--sub); margin-top: 10px; font-weight: 600; }
 
         #print-zone { display: flex; justify-content: center; margin-top: 40px; }
 
         /* --- ÉTIQUETTE 1.5x1in (Format Exact) --- */
+        /* Aperçu écran : vraie taille, bordure pointillée (retirée à l'impression) */
         .label-style { 
             display: flex; width: 1.5in; height: 1in; background: #fff !important; 
-            border: 1px solid #ccc; flex-direction: column; justify-content: center; 
-            align-items: center; color: #000 !important; transform: scale(1.5); 
-            transform-origin: center; box-shadow: 0 4px 15px rgba(0,0,0,0.1); 
+            border: 1px dashed #999; flex-direction: column; justify-content: center; 
+            align-items: center; color: #000 !important; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1); 
         }
 
         .barcode-box { width: 100%; display: flex; justify-content: center; align-items: center; flex-grow: 1; }
-        canvas { max-height: 0.60in; max-width: 0.60in; image-rendering: pixelated; }
+        /* Toujours <img> PNG pour l'impression (jamais de canvas) */
+        .barcode-box img { max-height: 0.60in; max-width: 0.60in; image-rendering: pixelated; }
 
         /* Chiffres en 7pt (CONSIGNE RESPECTÉE) */
         .res-text { font-weight: 800; font-size: 7pt; margin-top: 5px; letter-spacing: 1px; }
 
         .theme-toggle { position: fixed; bottom: 20px; right: 20px; width: 50px; height: 50px; background: var(--card); border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px rgba(0,0,0,0.2); cursor: pointer; border: 1px solid var(--sub); font-size: 22px; z-index: 1000; }
-
-        @media print {
-            .header, .container, .theme-toggle { display: none !important; }
-            body { background: white; }
-            #print-zone { margin: 0; display: block; }
-            .label-style { transform: scale(1); border: none; box-shadow: none; }
-            @page { size: 1.5in 1in; margin: 0; }
-        }
     </style>
 </head>
 <body>
@@ -65,7 +60,8 @@
                 <label>Numéro ou texte à encoder</label>
                 <input type="text" id="inputData" placeholder="ex: 5522051" onkeyup="update()">
             </div>
-            <button id="btnPrint" class="btn-print" onclick="window.print()">Imprimer</button>
+            <button id="btnPrint" class="btn-print" onclick="printLabels()">Imprimer</button>
+            <p class="print-hint" id="printHint">⚠️ Dialogue d'impression : Marges = <b>Aucune</b> | Échelle = <b>100%</b></p>
             <button onclick="location.reload()" style="background:none; border:none; color:var(--sub); width:100%; margin-top:15px; cursor:pointer; font-size:12px; font-weight: 600;">Réinitialiser</button>
         </div>
     </div>
@@ -73,38 +69,133 @@
     <div id="print-zone"></div>
 
     <script>
+        // Stocke la dernière étiquette générée (PNG data URL + texte)
+        let currentLabel = null;
+
+        function escapeHtml(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
         function update() {
             const val = document.getElementById('inputData').value.trim();
             const pz = document.getElementById('print-zone');
             const btn = document.getElementById('btnPrint');
+            const hint = document.getElementById('printHint');
 
             if (!val) {
                 pz.innerHTML = '';
                 btn.style.display = 'none';
+                hint.style.display = 'none';
+                currentLabel = null;
                 return;
             }
 
-            pz.innerHTML = `
-                <div class="label-style">
-                    <div class="barcode-box">
-                        <canvas id="canvas"></canvas>
-                    </div>
-                    <div class="res-text">${val}</div>
-                </div>
-            `;
-
             try {
                 // GÉNÉRATION DATA MATRIX (FORMAT POINTS SANS CARRÉS)
-                bwipjs.toCanvas('canvas', {
+                // → canvas temporaire converti en PNG data URL (obligatoire pour l'impression)
+                const canvas = document.createElement('canvas');
+                bwipjs.toCanvas(canvas, {
                     bcid: 'datamatrix',
                     text: val,
                     scale: 8,
                     padding: 2
                 });
+                const dataUrl = canvas.toDataURL('image/png');
+
+                currentLabel = { dataUrl: dataUrl, text: val };
+
+                pz.innerHTML = `
+                    <div class="label-style">
+                        <div class="barcode-box">
+                            <img src="${dataUrl}" alt="">
+                        </div>
+                        <div class="res-text">${escapeHtml(val)}</div>
+                    </div>
+                `;
                 btn.style.display = 'block';
+                hint.style.display = 'block';
             } catch (e) {
                 console.error(e);
             }
+        }
+
+        // Impression via iframe caché hors-écran : page propre, sans le shell de l'app.
+        // (width:0 empêche le rendu → top:-1000px avec vraies dimensions)
+        function printLabels() {
+            if (!currentLabel) { alert('Générez d\'abord un code'); return; }
+
+            const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Impression étiquettes</title>
+<style>
+    @page { size: 1.5in 1in; margin: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: white; }
+    .label {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        width: 1.5in; height: 1in;
+        padding: 0;
+        overflow: hidden;
+        page-break-after: always;
+    }
+    .label:last-child { page-break-after: auto; }
+    .label .barcode-box {
+        width: 100%;
+        display: flex; justify-content: center; align-items: center;
+        flex-grow: 1;
+    }
+    .label img {
+        max-height: 0.60in; max-width: 0.60in;
+        image-rendering: pixelated;
+    }
+    .label .res-text {
+        font-weight: 800;
+        font-size: 7pt;
+        margin-top: 5px;
+        letter-spacing: 1px;
+        font-family: 'Courier New', monospace;
+        color: #000;
+        text-align: center;
+        word-break: break-all;
+    }
+    @media print {
+        html, body { width: 1.5in !important; height: auto !important; margin: 0 !important; padding: 0 !important; }
+    }
+</style>
+</head>
+<body>
+    <div class="label">
+        <div class="barcode-box"><img src="${currentLabel.dataUrl}" alt=""></div>
+        <div class="res-text">${escapeHtml(currentLabel.text)}</div>
+    </div>
+</body>
+</html>`;
+
+            // Iframe caché hors-écran (jamais width:0 → page blanche à l'impression)
+            let iframe = document.getElementById('print-frame');
+            if (iframe) iframe.remove();
+            iframe = document.createElement('iframe');
+            iframe.id = 'print-frame';
+            iframe.style.cssText = 'position:fixed;top:-1000px;left:0;width:200mm;height:100mm;border:none;';
+            document.body.appendChild(iframe);
+
+            const doc = iframe.contentDocument || iframe.contentWindow.document;
+            doc.open();
+            doc.write(html);
+            doc.close();
+
+            // Impression après chargement des images
+            iframe.onload = () => {
+                setTimeout(() => {
+                    iframe.contentWindow.print();
+                    setTimeout(() => iframe.remove(), 2000);
+                }, 500);
+            };
         }
     </script>
 </body>
