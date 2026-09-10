@@ -24,6 +24,7 @@
 
         .btn-print { background: #34c759; color: #fff; display: none; width: 100%; padding: 18px; border-radius: 14px; border: none; font-weight: 800; font-size: 16px; text-transform: uppercase; cursor: pointer; margin-top: 10px; }
         .print-hint { display: none; text-align: center; font-size: 12px; color: var(--sub); margin-top: 10px; font-weight: 600; }
+        .mode-info { text-align: center; font-size: 11px; color: var(--sub); margin-top: 12px; font-weight: 600; }
 
         #print-zone { display: flex; justify-content: center; margin-top: 40px; }
 
@@ -62,6 +63,7 @@
             </div>
             <button id="btnPrint" class="btn-print" onclick="printLabels()">Imprimer</button>
             <p class="print-hint" id="printHint">⚠️ Dialogue d'impression : Marges = <b>Aucune</b> | Échelle = <b>100%</b></p>
+            <p class="mode-info" id="modeInfo"></p>
             <button onclick="location.reload()" style="background:none; border:none; color:var(--sub); width:100%; margin-top:15px; cursor:pointer; font-size:12px; font-weight: 600;">Réinitialiser</button>
         </div>
     </div>
@@ -69,11 +71,83 @@
     <div id="print-zone"></div>
 
     <script>
-        // Stocke la dernière étiquette générée (PNG data URL + texte)
+        // Stocke la dernière étiquette générée (PNG data URL + texte + ZPL)
         let currentLabel = null;
 
         function escapeHtml(s) {
             return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        /* =====================================================================
+           IMPRESSION — deux chemins
+           1) DIRECTE : Zebra Browser Print installé sur le poste → la page envoie
+              le ZPL natif à l'imprimante LP 2824 Plus (voir IMPRESSION-DIRECTE.md).
+              Silencieux, net au dot près, aucun dialogue.
+           2) NAVIGATEUR : repli automatique sur l'impression actuelle (iframe +
+              @page 1.5in x 1in), silencieuse si Chrome est lancé avec
+              --kiosk-printing (raccourci fourni).
+           ===================================================================== */
+        const PRINTER = {
+            dpi: 203,                 // Zebra LP 2824 Plus : 203 dpi = 8 dots/mm
+            labelW: 304,              // 1.5 in en dots
+            labelH: 203,              // 1 in en dots
+            dmModule: 6,              // module Data Matrix : 6 dots = 0,75 mm
+            dmQuality: 200,           // ECC 200 (obligatoire pour les douchettes actuelles)
+            useLabelLength: false,    // true = ajoute ^LL203 (recale la longueur d'étiquette)
+            utf8: true,               // false = accents remplacés (si l'imprimante affiche des carrés)
+            sdkFiles: ['BrowserPrint-3.1.250.min.js', 'BrowserPrint-3.0.216.min.js', 'BrowserPrint-1.0.4.min.js', 'BrowserPrint.min.js', 'browserprint.min.js'],
+            agentUrls: ['https://localhost:9101/available', 'http://localhost:9101/available']
+        };
+
+        // Texte destiné à un champ ^FD : on neutralise les caractères de contrôle ZPL
+        function zplText(s) {
+            let t = String(s == null ? '' : s).replace(/[\^~\\]/g, ' ').replace(/\s+/g, ' ').trim();
+            if (!PRINTER.utf8) t = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            return t;
+        }
+
+        function zplHeader() {
+            let s = '^XA\n';
+            if (PRINTER.utf8) s += '^CI28\n';
+            s += '^PW' + PRINTER.labelW + '\n';
+            if (PRINTER.useLabelLength) s += '^LL' + PRINTER.labelH + '\n';
+            return s;
+        }
+
+        // Points / Étoile : Data Matrix + texte en petit
+        function zplEtoile(code) {
+            return zplHeader()
+                + '^FO110,14^BXN,' + PRINTER.dmModule + ',' + PRINTER.dmQuality + ',0,0,6^FD' + zplText(code) + '^FS\n'
+                + '^FO0,150^A0N,34,28^FB' + PRINTER.labelW + ',1,0,C,0^FD' + zplText(code) + '^FS\n'
+                + '^XZ\n';
+        }
+
+        // Data Matrix rendu à la taille exacte de l'imprimante : 1 pixel = 1 dot (203 dpi),
+        // module entier (6 dots = 0,75 mm) + zone de silence de `quiet` modules.
+        // On part de la matrice de modules de bwip-js (raw) : aucun rééchantillonnage.
+        function dmPngData(text, moduleDots, quiet) {
+            const raw = bwipjs.raw({ bcid: 'datamatrix', text: String(text) })[0];
+            const cols = raw.pixx, rows = raw.pixy, pix = raw.pixs;
+            const side = (Math.max(cols, rows) + 2 * quiet) * moduleDots;
+            const cv = document.createElement('canvas');
+            cv.width = side; cv.height = side;
+            const ctx = cv.getContext('2d');
+            ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, side, side);
+            ctx.fillStyle = '#000';
+            const off = quiet * moduleDots;
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    if (pix[y * cols + x]) ctx.fillRect(off + x * moduleDots, off + y * moduleDots, moduleDots, moduleDots);
+                }
+            }
+            return { dataUrl: cv.toDataURL('image/png'), dots: side };
+        }
+
+        // Taille physique de l'image à l'impression : `dots` pixels imprimante à 203 dpi
+        function imgSizeStyle(dots) {
+            if (!dots) return '';
+            const inch = (dots / PRINTER.dpi).toFixed(4);
+            return ` style="width:${inch}in;height:${inch}in;max-width:none;max-height:none;"`;
         }
 
         function update() {
@@ -93,37 +167,108 @@
             try {
                 // GÉNÉRATION DATA MATRIX (FORMAT POINTS SANS CARRÉS)
                 // → canvas temporaire converti en PNG data URL (obligatoire pour l'impression)
-                const canvas = document.createElement('canvas');
-                bwipjs.toCanvas(canvas, {
-                    bcid: 'datamatrix',
-                    text: val,
-                    scale: 8,
-                    padding: 2
-                });
-                const dataUrl = canvas.toDataURL('image/png');
+                const dm = dmPngData(val, 6, 2);
+                const dataUrl = dm.dataUrl;
 
-                currentLabel = { dataUrl: dataUrl, text: val };
+                currentLabel = { dataUrl: dataUrl, text: val, zpl: zplEtoile(val), dots: dm.dots };
 
                 pz.innerHTML = `
                     <div class="label-style">
                         <div class="barcode-box">
-                            <img src="${dataUrl}" alt="">
+                            <img src="${dataUrl}" alt=""${imgSizeStyle(dm.dots)}>
                         </div>
                         <div class="res-text">${escapeHtml(val)}</div>
                     </div>
                 `;
                 btn.style.display = 'block';
                 hint.style.display = 'block';
+                updateModeInfo();
             } catch (e) {
                 console.error(e);
             }
         }
 
-        // Impression via iframe caché hors-écran : page propre, sans le shell de l'app.
-        // (width:0 empêche le rendu → top:-1000px avec vraies dimensions)
-        function printLabels() {
-            if (!currentLabel) { alert('Générez d\'abord un code'); return; }
+        /* ===================== Impression directe (Zebra) ===================== */
 
+        let bpState = null;          // null = pas encore testé, true/false ensuite
+        let bpProbe = null;          // promesse partagée
+
+        function updateModeInfo() {
+            const el = document.getElementById('modeInfo');
+            if (!el) return;
+            if (bpState === true) el.innerText = 'Impression directe : imprimante Zebra (silencieux)';
+            else if (bpState === false) el.innerText = 'Impression navigateur — Browser Print non détecté (Marges : Aucune, Échelle : 100%)';
+            else el.innerText = 'Détection de l\'imprimante…';
+        }
+
+        function probeUrl(url) {
+            return new Promise(resolve => {
+                const ctrl = new AbortController();
+                const t = setTimeout(() => { ctrl.abort(); resolve(false); }, 1200);
+                fetch(url, { method: 'GET', cache: 'no-store', signal: ctrl.signal })
+                    .then(() => { clearTimeout(t); resolve(true); })
+                    .catch(() => { clearTimeout(t); resolve(false); });
+            });
+        }
+
+        function loadScript(src) {
+            return new Promise(resolve => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = () => resolve(true);
+                s.onerror = () => resolve(false);
+                document.head.appendChild(s);
+            });
+        }
+
+        async function loadBrowserPrintSdk() {
+            if (window.BrowserPrint) return true;
+            const bases = window.BrowserPrintSdkBase ? [window.BrowserPrintSdkBase] : [''];
+            for (const b of bases) {
+                for (const f of PRINTER.sdkFiles) {
+                    await loadScript(b + f);
+                    if (window.BrowserPrint) return true;
+                }
+            }
+            return !!window.BrowserPrint;
+        }
+
+        function bpReady() {
+            if (bpProbe) return bpProbe;
+            bpProbe = (async () => {
+                let reachable = false;
+                for (const url of PRINTER.agentUrls) {
+                    if (await probeUrl(url)) { reachable = true; break; }
+                }
+                if (!reachable) { bpState = false; return false; }
+                const hasSdk = await loadBrowserPrintSdk();
+                bpState = hasSdk;
+                return hasSdk;
+            })();
+            return bpProbe;
+        }
+
+        function bpGetPrinter() {
+            return new Promise((resolve, reject) => {
+                BrowserPrint.getDefaultDevice('printer', d => d ? resolve(d) : reject(new Error('aucune imprimante par défaut')), e => reject(new Error(String(e))));
+            });
+        }
+
+        async function directPrint(zpl) {
+            if (!await bpReady()) return false;
+            try {
+                const printer = await bpGetPrinter();
+                await new Promise((resolve, reject) => printer.send(zpl, resolve, e => reject(new Error(String(e)))));
+                return true;
+            } catch (e) {
+                alert('Impression directe impossible : ' + (e.message || e) + '\n\nVérifiez que Browser Print est lancé et que l\'imprimante Zebra est allumée, puis réessayez.');
+                return 'error';
+            }
+        }
+
+        /* ===================== Impression navigateur (repli) ===================== */
+
+        function browserPrint() {
             const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -170,7 +315,7 @@
 </head>
 <body>
     <div class="label">
-        <div class="barcode-box"><img src="${currentLabel.dataUrl}" alt=""></div>
+        <div class="barcode-box"><img src="${currentLabel.dataUrl}" alt=""${imgSizeStyle(currentLabel.dots)}></div>
         <div class="res-text">${escapeHtml(currentLabel.text)}</div>
     </div>
 </body>
@@ -197,6 +342,21 @@
                 }, 500);
             };
         }
+
+        async function printLabels() {
+            if (!currentLabel) { alert('Générez d\'abord un code'); return; }
+
+            if (currentLabel.zpl) {
+                const res = await directPrint(currentLabel.zpl);
+                if (res === true) return;          // envoyé à l'imprimante, aucun dialogue
+                if (res === 'error') return;       // erreur signalée : on ne double pas l'impression
+            }
+            updateModeInfo();
+            browserPrint();
+        }
+
+        updateModeInfo();
+        bpReady().then(updateModeInfo);
     </script>
 </body>
 </html>
